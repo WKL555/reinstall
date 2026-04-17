@@ -1,0 +1,140 @@
+name: Build and Release Debian 13 UEFI Image
+
+on:
+  push:
+    tags:
+      - 'v*'               # 推送 v1.0 这类 tag 时触发构建和发布
+  workflow_dispatch:        # 允许手动触发
+
+env:
+  IMAGE_NAME: debian-13-uefi-minimal
+  DEBIAN_VERSION: trixie   # Debian 13 代号
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04   # 使用最新 Ubuntu，包含较新的 qemu-utils 等
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debootstrap qemu-utils parted dosfstools btrfs-progs grub-efi-amd64-bin arch-install-scripts
+
+      - name: Create blank disk image
+        run: |
+          # 创建一个 2.5G 的稀疏文件，实际占用空间很小
+          qemu-img create -f raw ${{ env.IMAGE_NAME }}.img 2.5G
+
+      - name: Partition disk image (GPT + EFI + Btrfs)
+        run: |
+          # 使用 parted 进行 GPT 分区
+          parted -s ${{ env.IMAGE_NAME }}.img mklabel gpt
+          # 创建 EFI 系统分区 (100MiB)
+          parted -s ${{ env.IMAGE_NAME }}.img mkpart primary fat32 1MiB 101MiB
+          parted -s ${{ env.IMAGE_NAME }}.img set 1 esp on
+          # 创建根分区 (剩余空间)
+          parted -s ${{ env.IMAGE_NAME }}.img mkpart primary btrfs 101MiB 100%
+          
+          # 将镜像文件挂载为循环设备
+          sudo losetup -Pf ${{ env.IMAGE_NAME }}.img
+          LOOP_DEV=$(sudo losetup -j ${{ env.IMAGE_NAME }}.img | cut -d: -f1)
+          echo "LOOP_DEV=$LOOP_DEV" >> $GITHUB_ENV
+          
+          # 格式化分区
+          sudo mkfs.fat -F32 ${LOOP_DEV}p1
+          sudo mkfs.btrfs -f ${LOOP_DEV}p2
+
+      - name: Mount partitions and install base system
+        run: |
+          # 挂载根分区
+          sudo mount -o compress=zstd,noatime ${LOOP_DEV}p2 /mnt
+          
+          # 创建必要目录并挂载 EFI 分区
+          sudo mkdir -p /mnt/boot/efi
+          sudo mount ${LOOP_DEV}p1 /mnt/boot/efi
+          
+          # 使用 debootstrap 安装 Debian Trixie 基础系统
+          sudo debootstrap --arch amd64 \
+            --include=linux-image-amd64,grub-efi-amd64,systemd-resolved,systemd-timesyncd,curl,btrfs-progs,dosfstools \
+            ${{ env.DEBIAN_VERSION }} /mnt https://deb.debian.org/debian
+          
+          # 生成 fstab
+          sudo genfstab -U /mnt | sudo tee /mnt/etc/fstab
+
+      - name: Configure system inside chroot
+        run: |
+          # 挂载必要的虚拟文件系统
+          sudo mount --bind /dev /mnt/dev
+          sudo mount --bind /proc /mnt/proc
+          sudo mount --bind /sys /mnt/sys
+          
+          # 复制 chroot 配置脚本
+          cat > /tmp/chroot-script.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          # 设置时区
+          ln -sf /usr/share/zoneinfo/Etc/UTC /etc/localtime
+          
+          # 设置主机名
+          echo "debian-minimal" > /etc/hostname
+          
+          # 配置 locales (只保留 en_US.UTF-8 以精简)
+          echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+          locale-gen
+          update-locale LANG=en_US.UTF-8
+          
+          # 设置 root 密码为 "debian" (可选，用户可自行修改)
+          echo "root:debian" | chpasswd
+          
+          # 允许 root SSH 登录 (可选，默认禁止)
+          sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          
+          # 启用 systemd-networkd 和 resolved (轻量网络管理)
+          systemctl enable systemd-networkd
+          systemctl enable systemd-resolved
+          
+          # 安装并配置 GRUB 引导器 (UEFI)
+          grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Debian --removable --no-nvram
+          update-grub
+          
+          # 清理 apt 缓存减小镜像体积
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+          EOF
+          
+          sudo chmod +x /tmp/chroot-script.sh
+          sudo cp /tmp/chroot-script.sh /mnt/tmp/
+          sudo chroot /mnt /tmp/chroot-script.sh
+          
+          # 卸载虚拟文件系统
+          sudo umount /mnt/dev
+          sudo umount /mnt/proc
+          sudo umount /mnt/sys
+
+      - name: Unmount and detach loop device
+        if: always()
+        run: |
+          sudo umount -R /mnt || true
+          sudo losetup -d $LOOP_DEV || true
+
+      - name: Compress image
+        run: |
+          # 压缩为 qcow2 格式，体积更小
+          qemu-img convert -f raw -O qcow2 ${{ env.IMAGE_NAME }}.img ${{ env.IMAGE_NAME }}.qcow2
+          # 也可以压缩为 .xz 方便分发
+          xz -9 -k ${{ env.IMAGE_NAME }}.img
+          mv ${{ env.IMAGE_NAME }}.img.xz ${{ env.IMAGE_NAME }}.img.xz
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            ${{ env.IMAGE_NAME }}.qcow2
+            ${{ env.IMAGE_NAME }}.img.xz
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
